@@ -16,7 +16,7 @@ menu {
   height: 100%;
   white-space: nowrap;
   text-overflow: ellipsis;
-  overflow: hidden;
+  overflow: auto;
   color: var(--menuForegroundColor);
   display: flex;
   flex-direction: column;
@@ -39,17 +39,13 @@ menu {
     justify-content: center;
     margin-bottom: 35px;
 
-    img {
-      @include avatar(34px);
-
-      margin-left: 20px;
-      margin-right: 10px;
-    }
-
     .logged-in-info {
       flex-grow: 1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
 
-      .logged-in-username {
+      .logged-in-display-name {
         font-size: 16px;
         font-weight: $font-semibold;
         color: var(--menuForegroundColor);
@@ -58,7 +54,7 @@ menu {
         @include disable-default-a-behaviour;
       }
 
-      .logged-in-email {
+      .logged-in-username {
         font-size: 13px;
         color: #C6C6C6;
         white-space: nowrap;
@@ -250,7 +246,7 @@ menu {
   }
 }
 
-@media screen and (max-width: 400px) {
+@media screen and (max-width: $mobile-view) {
   .menu-wrapper {
     width: 100% !important;
   }

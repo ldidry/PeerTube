@@ -39,6 +39,7 @@ function buildVideoLink (time?: number, url?: string) {
 }
 
 function timeToInt (time: number | string) {
+  if (!time) return 0
   if (typeof time === 'number') return time
 
   const reg = /^((\d+)h)?((\d+)m)?((\d+)s?)?$/
@@ -111,9 +112,23 @@ function videoFileMinByResolution (files: VideoFile[]) {
   return min
 }
 
+function getRtcConfig () {
+  return {
+    iceServers: [
+      {
+        urls: 'stun:stun.stunprotocol.org'
+      },
+      {
+        urls: 'stun:stun.framasoft.org'
+      }
+    ]
+  }
+}
+
 // ---------------------------------------------------------------------------
 
 export {
+  getRtcConfig,
   toTitleCase,
   timeToInt,
   buildVideoLink,

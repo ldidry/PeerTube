@@ -40,7 +40,7 @@ import {
   isVideoDurationValid,
   isVideoLanguageValid,
   isVideoLicenceValid,
-  isVideoNameValid,
+  isVideoNameValid, isVideoOriginallyPublishedAtValid,
   isVideoPrivacyValid,
   isVideoStateValid,
   isVideoSupportValid
@@ -52,7 +52,7 @@ import {
   ACTIVITY_PUB,
   API_VERSION,
   CONFIG,
-  CONSTRAINTS_FIELDS,
+  CONSTRAINTS_FIELDS, HLS_PLAYLIST_DIRECTORY, HLS_REDUNDANCY_DIRECTORY,
   PREVIEWS_SIZE,
   REMOTE_SCHEME,
   STATIC_DOWNLOAD_PATHS,
@@ -94,6 +94,8 @@ import {
 import * as validator from 'validator'
 import { UserVideoHistoryModel } from '../account/user-video-history'
 import { UserModel } from '../account/user'
+import { VideoImportModel } from './video-import'
+import { VideoStreamingPlaylistModel } from './video-streaming-playlist'
 
 // FIXME: Define indexes here because there is an issue with TS and Sequelize.literal when called directly in the annotation
 const indexes: Sequelize.DefineIndexesOptions[] = [
@@ -102,16 +104,52 @@ const indexes: Sequelize.DefineIndexesOptions[] = [
   { fields: [ 'createdAt' ] },
   { fields: [ 'publishedAt' ] },
   { fields: [ 'duration' ] },
-  { fields: [ 'category' ] },
-  { fields: [ 'licence' ] },
-  { fields: [ 'nsfw' ] },
-  { fields: [ 'language' ] },
-  { fields: [ 'waitTranscoding' ] },
-  { fields: [ 'state' ] },
-  { fields: [ 'remote' ] },
   { fields: [ 'views' ] },
-  { fields: [ 'likes' ] },
   { fields: [ 'channelId' ] },
+  {
+    fields: [ 'originallyPublishedAt' ],
+    where: {
+      originallyPublishedAt: {
+        [Sequelize.Op.ne]: null
+      }
+    }
+  },
+  {
+    fields: [ 'category' ], // We don't care videos with an unknown category
+    where: {
+      category: {
+        [Sequelize.Op.ne]: null
+      }
+    }
+  },
+  {
+    fields: [ 'licence' ], // We don't care videos with an unknown licence
+    where: {
+      licence: {
+        [Sequelize.Op.ne]: null
+      }
+    }
+  },
+  {
+    fields: [ 'language' ], // We don't care videos with an unknown language
+    where: {
+      language: {
+        [Sequelize.Op.ne]: null
+      }
+    }
+  },
+  {
+    fields: [ 'nsfw' ], // Most of the videos are not NSFW
+    where: {
+      nsfw: true
+    }
+  },
+  {
+    fields: [ 'remote' ], // Only index local videos
+    where: {
+      remote: false
+    }
+  },
   {
     fields: [ 'uuid' ],
     unique: true
@@ -130,7 +168,9 @@ export enum ScopeNames {
   WITH_FILES = 'WITH_FILES',
   WITH_SCHEDULED_UPDATE = 'WITH_SCHEDULED_UPDATE',
   WITH_BLACKLISTED = 'WITH_BLACKLISTED',
-  WITH_USER_HISTORY = 'WITH_USER_HISTORY'
+  WITH_USER_HISTORY = 'WITH_USER_HISTORY',
+  WITH_STREAMING_PLAYLISTS = 'WITH_STREAMING_PLAYLISTS',
+  WITH_USER_ID = 'WITH_USER_ID'
 }
 
 type ForAPIOptions = {
@@ -140,7 +180,7 @@ type ForAPIOptions = {
 
 type AvailableForListIDsOptions = {
   serverAccountId: number
-  actorId: number
+  followerActorId: number
   includeLocalVideos: boolean
   filter?: VideoFilter
   categoryOneOf?: number[]
@@ -153,7 +193,8 @@ type AvailableForListIDsOptions = {
   accountId?: number
   videoChannelId?: number
   trendingDays?: number
-  user?: UserModel
+  user?: UserModel,
+  historyOfUser?: UserModel
 }
 
 @Scopes({
@@ -315,7 +356,7 @@ type AvailableForListIDsOptions = {
       query.include.push(videoChannelInclude)
     }
 
-    if (options.actorId) {
+    if (options.followerActorId) {
       let localVideosReq = ''
       if (options.includeLocalVideos === true) {
         localVideosReq = ' UNION ALL ' +
@@ -327,7 +368,7 @@ type AvailableForListIDsOptions = {
       }
 
       // Force actorId to be a number to avoid SQL injections
-      const actorIdNumber = parseInt(options.actorId.toString(), 10)
+      const actorIdNumber = parseInt(options.followerActorId.toString(), 10)
       query.where[ 'id' ][ Sequelize.Op.and ].push({
         [ Sequelize.Op.in ]: Sequelize.literal(
           '(' +
@@ -416,7 +457,38 @@ type AvailableForListIDsOptions = {
       query.subQuery = false
     }
 
+    if (options.historyOfUser) {
+      query.include.push({
+        model: UserVideoHistoryModel,
+        required: true,
+        where: {
+          userId: options.historyOfUser.id
+        }
+      })
+
+      // Even if the relation is n:m, we know that a user only have 0..1 video history
+      // So we won't have multiple rows for the same video
+      // Without this, we would not be able to sort on "updatedAt" column of UserVideoHistoryModel
+      query.subQuery = false
+    }
+
     return query
+  },
+  [ ScopeNames.WITH_USER_ID ]: {
+    include: [
+      {
+        attributes: [ 'accountId' ],
+        model: () => VideoChannelModel.unscoped(),
+        required: true,
+        include: [
+          {
+            attributes: [ 'userId' ],
+            model: () => AccountModel.unscoped(),
+            required: true
+          }
+        ]
+      }
+    ]
   },
   [ ScopeNames.WITH_ACCOUNT_DETAILS ]: {
     include: [
@@ -482,22 +554,55 @@ type AvailableForListIDsOptions = {
       }
     ]
   },
-  [ ScopeNames.WITH_FILES ]: {
-    include: [
-      {
-        model: () => VideoFileModel.unscoped(),
-        // FIXME: typings
-        [ 'separate' as any ]: true, // We may have multiple files, having multiple redundancies so let's separate this join
-        required: false,
-        include: [
-          {
-            attributes: [ 'fileUrl' ],
-            model: () => VideoRedundancyModel.unscoped(),
-            required: false
-          }
-        ]
-      }
-    ]
+  [ ScopeNames.WITH_FILES ]: (withRedundancies = false) => {
+    let subInclude: any[] = []
+
+    if (withRedundancies === true) {
+      subInclude = [
+        {
+          attributes: [ 'fileUrl' ],
+          model: VideoRedundancyModel.unscoped(),
+          required: false
+        }
+      ]
+    }
+
+    return {
+      include: [
+        {
+          model: VideoFileModel.unscoped(),
+          // FIXME: typings
+          [ 'separate' as any ]: true, // We may have multiple files, having multiple redundancies so let's separate this join
+          required: false,
+          include: subInclude
+        }
+      ]
+    }
+  },
+  [ ScopeNames.WITH_STREAMING_PLAYLISTS ]: (withRedundancies = false) => {
+    let subInclude: any[] = []
+
+    if (withRedundancies === true) {
+      subInclude = [
+        {
+          attributes: [ 'fileUrl' ],
+          model: VideoRedundancyModel.unscoped(),
+          required: false
+        }
+      ]
+    }
+
+    return {
+      include: [
+        {
+          model: VideoStreamingPlaylistModel.unscoped(),
+          // FIXME: typings
+          [ 'separate' as any ]: true, // We may have multiple streaming playlists, having multiple redundancies so let's separate this join
+          required: false,
+          include: subInclude
+        }
+      ]
+    }
   },
   [ ScopeNames.WITH_SCHEDULED_UPDATE ]: {
     include: [
@@ -620,6 +725,10 @@ export class VideoModel extends Model<VideoModel> {
 
   @AllowNull(false)
   @Column
+  downloadEnabled: boolean
+
+  @AllowNull(false)
+  @Column
   waitTranscoding: boolean
 
   @AllowNull(false)
@@ -638,6 +747,11 @@ export class VideoModel extends Model<VideoModel> {
   @Default(Sequelize.NOW)
   @Column
   publishedAt: Date
+
+  @AllowNull(true)
+  @Default(null)
+  @Column
+  originallyPublishedAt: Date
 
   @ForeignKey(() => VideoChannelModel)
   @Column
@@ -676,6 +790,16 @@ export class VideoModel extends Model<VideoModel> {
     onDelete: 'cascade'
   })
   VideoFiles: VideoFileModel[]
+
+  @HasMany(() => VideoStreamingPlaylistModel, {
+    foreignKey: {
+      name: 'videoId',
+      allowNull: false
+    },
+    hooks: true,
+    onDelete: 'cascade'
+  })
+  VideoStreamingPlaylists: VideoStreamingPlaylistModel[]
 
   @HasMany(() => VideoShareModel, {
     foreignKey: {
@@ -741,6 +865,15 @@ export class VideoModel extends Model<VideoModel> {
   })
   VideoBlacklist: VideoBlacklistModel
 
+  @HasOne(() => VideoImportModel, {
+    foreignKey: {
+      name: 'videoId',
+      allowNull: true
+    },
+    onDelete: 'set null'
+  })
+  VideoImport: VideoImportModel
+
   @HasMany(() => VideoCaptionModel, {
     foreignKey: {
       name: 'videoId',
@@ -793,6 +926,9 @@ export class VideoModel extends Model<VideoModel> {
         tasks.push(instance.removeFile(file))
         tasks.push(instance.removeTorrent(file))
       })
+
+      // Remove playlists file
+      tasks.push(instance.removeStreamingPlaylist())
     }
 
     // Do not wait video deletion because we could be in a transaction
@@ -804,10 +940,6 @@ export class VideoModel extends Model<VideoModel> {
     return undefined
   }
 
-  static list () {
-    return VideoModel.scope(ScopeNames.WITH_FILES).findAll()
-  }
-
   static listLocal () {
     const query = {
       where: {
@@ -815,7 +947,7 @@ export class VideoModel extends Model<VideoModel> {
       }
     }
 
-    return VideoModel.scope(ScopeNames.WITH_FILES).findAll(query)
+    return VideoModel.scope([ ScopeNames.WITH_FILES, ScopeNames.WITH_STREAMING_PLAYLISTS ]).findAll(query)
   }
 
   static listAllAndSharedByActorForOutbox (actorId: number, start: number, count: number) {
@@ -985,9 +1117,10 @@ export class VideoModel extends Model<VideoModel> {
     filter?: VideoFilter,
     accountId?: number,
     videoChannelId?: number,
-    actorId?: number
+    followerActorId?: number
     trendingDays?: number,
-    user?: UserModel
+    user?: UserModel,
+    historyOfUser?: UserModel
   }, countVideos = true) {
     if (options.filter && options.filter === 'all-local' && !options.user.hasRight(UserRight.SEE_ALL_VIDEOS)) {
       throw new Error('Try to filter all-local but no user has not the see all videos right')
@@ -1008,11 +1141,11 @@ export class VideoModel extends Model<VideoModel> {
 
     const serverActor = await getServerActor()
 
-    // actorId === null has a meaning, so just check undefined
-    const actorId = options.actorId !== undefined ? options.actorId : serverActor.id
+    // followerActorId === null has a meaning, so just check undefined
+    const followerActorId = options.followerActorId !== undefined ? options.followerActorId : serverActor.id
 
     const queryOptions = {
-      actorId,
+      followerActorId,
       serverAccountId: serverActor.Account.id,
       nsfw: options.nsfw,
       categoryOneOf: options.categoryOneOf,
@@ -1026,6 +1159,7 @@ export class VideoModel extends Model<VideoModel> {
       videoChannelId: options.videoChannelId,
       includeLocalVideos: options.includeLocalVideos,
       user: options.user,
+      historyOfUser: options.historyOfUser,
       trendingDays
     }
 
@@ -1040,6 +1174,8 @@ export class VideoModel extends Model<VideoModel> {
     sort?: string
     startDate?: string // ISO 8601
     endDate?: string // ISO 8601
+    originallyPublishedStartDate?: string
+    originallyPublishedEndDate?: string
     nsfw?: boolean
     categoryOneOf?: number[]
     licenceOneOf?: number[]
@@ -1060,6 +1196,15 @@ export class VideoModel extends Model<VideoModel> {
       if (options.endDate) publishedAtRange[ Sequelize.Op.lte ] = options.endDate
 
       whereAnd.push({ publishedAt: publishedAtRange })
+    }
+
+    if (options.originallyPublishedStartDate || options.originallyPublishedEndDate) {
+      const originallyPublishedAtRange = {}
+
+      if (options.originallyPublishedStartDate) originallyPublishedAtRange[ Sequelize.Op.gte ] = options.originallyPublishedStartDate
+      if (options.originallyPublishedEndDate) originallyPublishedAtRange[ Sequelize.Op.lte ] = options.originallyPublishedEndDate
+
+      whereAnd.push({ originallyPublishedAt: originallyPublishedAtRange })
     }
 
     if (options.durationMin || options.durationMax) {
@@ -1118,7 +1263,7 @@ export class VideoModel extends Model<VideoModel> {
 
     const serverActor = await getServerActor()
     const queryOptions = {
-      actorId: serverActor.id,
+      followerActorId: serverActor.id,
       serverAccountId: serverActor.Account.id,
       includeLocalVideos: options.includeLocalVideos,
       nsfw: options.nsfw,
@@ -1144,6 +1289,16 @@ export class VideoModel extends Model<VideoModel> {
     return VideoModel.findOne(options)
   }
 
+  static loadWithRights (id: number | string, t?: Sequelize.Transaction) {
+    const where = VideoModel.buildWhereIdOrUUID(id)
+    const options = {
+      where,
+      transaction: t
+    }
+
+    return VideoModel.scope([ ScopeNames.WITH_BLACKLISTED, ScopeNames.WITH_USER_ID ]).findOne(options)
+  }
+
   static loadOnlyId (id: number | string, t?: Sequelize.Transaction) {
     const where = VideoModel.buildWhereIdOrUUID(id)
 
@@ -1156,8 +1311,8 @@ export class VideoModel extends Model<VideoModel> {
     return VideoModel.findOne(options)
   }
 
-  static loadWithFile (id: number, t?: Sequelize.Transaction, logging?: boolean) {
-    return VideoModel.scope(ScopeNames.WITH_FILES)
+  static loadWithFiles (id: number, t?: Sequelize.Transaction, logging?: boolean) {
+    return VideoModel.scope([ ScopeNames.WITH_FILES, ScopeNames.WITH_STREAMING_PLAYLISTS ])
                      .findById(id, { transaction: t, logging })
   }
 
@@ -1168,9 +1323,7 @@ export class VideoModel extends Model<VideoModel> {
       }
     }
 
-    return VideoModel
-      .scope([ ScopeNames.WITH_FILES ])
-      .findOne(options)
+    return VideoModel.findOne(options)
   }
 
   static loadByUrl (url: string, transaction?: Sequelize.Transaction) {
@@ -1192,7 +1345,11 @@ export class VideoModel extends Model<VideoModel> {
       transaction
     }
 
-    return VideoModel.scope([ ScopeNames.WITH_ACCOUNT_DETAILS, ScopeNames.WITH_FILES ]).findOne(query)
+    return VideoModel.scope([
+      ScopeNames.WITH_ACCOUNT_DETAILS,
+      ScopeNames.WITH_FILES,
+      ScopeNames.WITH_STREAMING_PLAYLISTS
+    ]).findOne(query)
   }
 
   static loadAndPopulateAccountAndServerAndTags (id: number | string, t?: Sequelize.Transaction, userId?: number) {
@@ -1207,9 +1364,37 @@ export class VideoModel extends Model<VideoModel> {
     const scopes = [
       ScopeNames.WITH_TAGS,
       ScopeNames.WITH_BLACKLISTED,
-      ScopeNames.WITH_FILES,
       ScopeNames.WITH_ACCOUNT_DETAILS,
-      ScopeNames.WITH_SCHEDULED_UPDATE
+      ScopeNames.WITH_SCHEDULED_UPDATE,
+      ScopeNames.WITH_FILES,
+      ScopeNames.WITH_STREAMING_PLAYLISTS
+    ]
+
+    if (userId) {
+      scopes.push({ method: [ ScopeNames.WITH_USER_HISTORY, userId ] } as any) // FIXME: typings
+    }
+
+    return VideoModel
+      .scope(scopes)
+      .findOne(options)
+  }
+
+  static loadForGetAPI (id: number | string, t?: Sequelize.Transaction, userId?: number) {
+    const where = VideoModel.buildWhereIdOrUUID(id)
+
+    const options = {
+      order: [ [ 'Tags', 'name', 'ASC' ] ],
+      where,
+      transaction: t
+    }
+
+    const scopes = [
+      ScopeNames.WITH_TAGS,
+      ScopeNames.WITH_BLACKLISTED,
+      ScopeNames.WITH_ACCOUNT_DETAILS,
+      ScopeNames.WITH_SCHEDULED_UPDATE,
+      { method: [ ScopeNames.WITH_FILES, true ] } as any, // FIXME: typings
+      { method: [ ScopeNames.WITH_STREAMING_PLAYLISTS, true ] } as any // FIXME: typings
     ]
 
     if (userId) {
@@ -1273,11 +1458,11 @@ export class VideoModel extends Model<VideoModel> {
   // threshold corresponds to how many video the field should have to be returned
   static async getRandomFieldSamples (field: 'category' | 'channelId', threshold: number, count: number) {
     const serverActor = await getServerActor()
-    const actorId = serverActor.id
+    const followerActorId = serverActor.id
 
     const scopeOptions: AvailableForListIDsOptions = {
       serverAccountId: serverActor.Account.id,
-      actorId,
+      followerActorId,
       includeLocalVideos: true
     }
 
@@ -1341,7 +1526,7 @@ export class VideoModel extends Model<VideoModel> {
     }
 
     const [ count, rowsId ] = await Promise.all([
-      countVideos ? VideoModel.scope(countScope).count(countQuery) : Promise.resolve(undefined),
+      countVideos ? VideoModel.scope(countScope).count(countQuery) : Promise.resolve<number>(undefined),
       VideoModel.scope(idsScope).findAll(query)
     ])
     const ids = rowsId.map(r => r.id)
@@ -1481,6 +1666,10 @@ export class VideoModel extends Model<VideoModel> {
     videoFile.infoHash = parsedTorrent.infoHash
   }
 
+  getWatchStaticPath () {
+    return '/videos/watch/' + this.uuid
+  }
+
   getEmbedStaticPath () {
     return '/videos/embed/' + this.uuid
   }
@@ -1538,8 +1727,10 @@ export class VideoModel extends Model<VideoModel> {
       .catch(err => logger.warn('Cannot delete preview %s.', previewPath, { err }))
   }
 
-  removeFile (videoFile: VideoFileModel) {
-    const filePath = join(CONFIG.STORAGE.VIDEOS_DIR, this.getVideoFilename(videoFile))
+  removeFile (videoFile: VideoFileModel, isRedundancy = false) {
+    const baseDir = isRedundancy ? CONFIG.STORAGE.REDUNDANCY_DIR : CONFIG.STORAGE.VIDEOS_DIR
+
+    const filePath = join(baseDir, this.getVideoFilename(videoFile))
     return remove(filePath)
       .catch(err => logger.warn('Cannot delete file %s.', filePath, { err }))
   }
@@ -1548,6 +1739,14 @@ export class VideoModel extends Model<VideoModel> {
     const torrentPath = join(CONFIG.STORAGE.TORRENTS_DIR, this.getTorrentFileName(videoFile))
     return remove(torrentPath)
       .catch(err => logger.warn('Cannot delete torrent %s.', torrentPath, { err }))
+  }
+
+  removeStreamingPlaylist (isRedundancy = false) {
+    const baseDir = isRedundancy ? HLS_REDUNDANCY_DIRECTORY : HLS_PLAYLIST_DIRECTORY
+
+    const filePath = join(baseDir, this.uuid)
+    return remove(filePath)
+      .catch(err => logger.warn('Cannot delete playlist directory %s.', filePath, { err }))
   }
 
   isOutdated () {
@@ -1584,7 +1783,7 @@ export class VideoModel extends Model<VideoModel> {
 
   generateMagnetUri (videoFile: VideoFileModel, baseUrlHttp: string, baseUrlWs: string) {
     const xs = this.getTorrentUrl(videoFile, baseUrlHttp)
-    const announce = [ baseUrlWs + '/tracker/socket', baseUrlHttp + '/tracker/announce' ]
+    const announce = this.getTrackerUrls(baseUrlHttp, baseUrlWs)
     let urlList = [ this.getVideoFileUrl(videoFile, baseUrlHttp) ]
 
     const redundancies = videoFile.RedundancyVideos
@@ -1599,6 +1798,10 @@ export class VideoModel extends Model<VideoModel> {
     }
 
     return magnetUtil.encode(magnetHash)
+  }
+
+  getTrackerUrls (baseUrlHttp: string, baseUrlWs: string) {
+    return [ baseUrlWs + '/tracker/socket', baseUrlHttp + '/tracker/announce' ]
   }
 
   getThumbnailUrl (baseUrlHttp: string) {
@@ -1617,7 +1820,15 @@ export class VideoModel extends Model<VideoModel> {
     return baseUrlHttp + STATIC_PATHS.WEBSEED + this.getVideoFilename(videoFile)
   }
 
+  getVideoRedundancyUrl (videoFile: VideoFileModel, baseUrlHttp: string) {
+    return baseUrlHttp + STATIC_PATHS.REDUNDANCY + this.getVideoFilename(videoFile)
+  }
+
   getVideoFileDownloadUrl (videoFile: VideoFileModel, baseUrlHttp: string) {
     return baseUrlHttp + STATIC_DOWNLOAD_PATHS.VIDEOS + this.getVideoFilename(videoFile)
+  }
+
+  getBandwidthBits (videoFile: VideoFileModel) {
+    return Math.ceil((videoFile.size * 8) / this.duration)
   }
 }

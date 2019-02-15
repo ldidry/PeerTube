@@ -2,8 +2,12 @@
 
 import 'mocha'
 
-import { flushTests, immutableAssign, killallServers, makeGetRequest, runServer, ServerInfo } from '../../utils'
-import { checkBadCountPagination, checkBadSortPagination, checkBadStartPagination } from '../../utils/requests/check-api-params'
+import { flushTests, immutableAssign, killallServers, makeGetRequest, runServer, ServerInfo } from '../../../../shared/utils'
+import {
+  checkBadCountPagination,
+  checkBadSortPagination,
+  checkBadStartPagination
+} from '../../../../shared/utils/requests/check-api-params'
 
 describe('Test videos API validator', function () {
   let server: ServerInfo
@@ -109,6 +113,12 @@ describe('Test videos API validator', function () {
 
       const customQuery2 = immutableAssign(query, { endDate: 'hello' })
       await makeGetRequest({ url: server.url, path, query: customQuery2, statusCodeExpected: 400 })
+
+      const customQuery3 = immutableAssign(query, { originallyPublishedStartDate: 'hello' })
+      await makeGetRequest({ url: server.url, path, query: customQuery3, statusCodeExpected: 400 })
+
+      const customQuery4 = immutableAssign(query, { originallyPublishedEndDate: 'hello' })
+      await makeGetRequest({ url: server.url, path, query: customQuery4, statusCodeExpected: 400 })
     })
   })
 

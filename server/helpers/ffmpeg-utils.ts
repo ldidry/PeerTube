@@ -1,11 +1,11 @@
 import * as ffmpeg from 'fluent-ffmpeg'
-import { join } from 'path'
+import { dirname, join } from 'path'
 import { getTargetBitrate, VideoResolution } from '../../shared/models/videos'
 import { CONFIG, FFMPEG_NICE, VIDEO_TRANSCODING_FPS } from '../initializers/constants'
 import { processImage } from './image-utils'
 import { logger } from './logger'
 import { checkFFmpegEncoders } from '../initializers/checker-before-init'
-import { remove } from 'fs-extra'
+import { remove, readFile, writeFile } from 'fs-extra'
 
 function computeResolutionsToTranscode (videoFileHeight: number) {
   const resolutionsEnabled: number[] = []
@@ -29,19 +29,28 @@ function computeResolutionsToTranscode (videoFileHeight: number) {
   return resolutionsEnabled
 }
 
-async function getVideoFileResolution (path: string) {
+async function getVideoFileSize (path: string) {
   const videoStream = await getVideoFileStream(path)
 
   return {
-    videoFileResolution: Math.min(videoStream.height, videoStream.width),
-    isPortraitMode: videoStream.height > videoStream.width
+    width: videoStream.width,
+    height: videoStream.height
+  }
+}
+
+async function getVideoFileResolution (path: string) {
+  const size = await getVideoFileSize(path)
+
+  return {
+    videoFileResolution: Math.min(size.height, size.width),
+    isPortraitMode: size.height > size.width
   }
 }
 
 async function getVideoFileFPS (path: string) {
   const videoStream = await getVideoFileStream(path)
 
-  for (const key of [ 'r_frame_rate' , 'avg_frame_rate' ]) {
+  for (const key of [ 'avg_frame_rate', 'r_frame_rate' ]) {
     const valuesText: string = videoStream[key]
     if (!valuesText) continue
 
@@ -110,8 +119,12 @@ async function generateImageFromVideoFile (fromPath: string, folder: string, ima
 type TranscodeOptions = {
   inputPath: string
   outputPath: string
-  resolution?: VideoResolution
+  resolution: VideoResolution
   isPortraitMode?: boolean
+
+  hlsPlaylist?: {
+    videoFilename: string
+  }
 }
 
 function transcode (options: TranscodeOptions) {
@@ -150,12 +163,28 @@ function transcode (options: TranscodeOptions) {
         command = command.withFPS(fps)
       }
 
+      if (options.hlsPlaylist) {
+        const videoPath = getHLSVideoPath(options)
+
+        command = command.outputOption('-hls_time 4')
+                         .outputOption('-hls_list_size 0')
+                         .outputOption('-hls_playlist_type vod')
+                         .outputOption('-hls_segment_filename ' + videoPath)
+                         .outputOption('-hls_segment_type fmp4')
+                         .outputOption('-f hls')
+                         .outputOption('-hls_flags single_file')
+      }
+
       command
         .on('error', (err, stdout, stderr) => {
           logger.error('Error in transcoding job.', { stdout, stderr })
           return rej(err)
         })
-        .on('end', res)
+        .on('end', () => {
+          return onTranscodingSuccess(options)
+            .then(() => res())
+            .catch(err => rej(err))
+        })
         .run()
     } catch (err) {
       return rej(err)
@@ -166,6 +195,7 @@ function transcode (options: TranscodeOptions) {
 // ---------------------------------------------------------------------------
 
 export {
+  getVideoFileSize,
   getVideoFileResolution,
   getDurationFromVideoFile,
   generateImageFromVideoFile,
@@ -178,13 +208,32 @@ export {
 
 // ---------------------------------------------------------------------------
 
+function getHLSVideoPath (options: TranscodeOptions) {
+  return `${dirname(options.outputPath)}/${options.hlsPlaylist.videoFilename}`
+}
+
+async function onTranscodingSuccess (options: TranscodeOptions) {
+  if (!options.hlsPlaylist) return
+
+  // Fix wrong mapping with some ffmpeg versions
+  const fileContent = await readFile(options.outputPath)
+
+  const videoFileName = options.hlsPlaylist.videoFilename
+  const videoFilePath = getHLSVideoPath(options)
+
+  const newContent = fileContent.toString()
+                                .replace(`#EXT-X-MAP:URI="${videoFilePath}",`, `#EXT-X-MAP:URI="${videoFileName}",`)
+
+  await writeFile(options.outputPath, newContent)
+}
+
 function getVideoFileStream (path: string) {
   return new Promise<any>((res, rej) => {
     ffmpeg.ffprobe(path, (err, metadata) => {
       if (err) return rej(err)
 
       const videoStream = metadata.streams.find(s => s.codec_type === 'video')
-      if (!videoStream) throw new Error('Cannot find video stream of ' + path)
+      if (!videoStream) return rej(new Error('Cannot find video stream of ' + path))
 
       return res(videoStream)
     })
@@ -328,10 +377,10 @@ async function presetH264 (command: ffmpeg.FfmpegCommand, resolution: VideoResol
     const audioCodecName = parsedAudio.audioStream[ 'codec_name' ]
     let bitrate: number
     if (audio.bitrate[ audioCodecName ]) {
-      bitrate = audio.bitrate[ audioCodecName ](parsedAudio.audioStream[ 'bit_rate' ])
+      localCommand = localCommand.audioCodec('aac')
 
-      if (bitrate === -1) localCommand = localCommand.audioCodec('copy')
-      else if (bitrate !== undefined) localCommand = localCommand.audioBitrate(bitrate)
+      bitrate = audio.bitrate[ audioCodecName ](parsedAudio.audioStream[ 'bit_rate' ])
+      if (bitrate !== undefined && bitrate !== -1) localCommand = localCommand.audioBitrate(bitrate)
     }
   }
 

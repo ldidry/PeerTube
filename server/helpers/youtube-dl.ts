@@ -1,7 +1,7 @@
 import { truncate } from 'lodash'
 import { CONSTRAINTS_FIELDS, VIDEO_CATEGORIES } from '../initializers'
 import { logger } from './logger'
-import { generateVideoTmpPath } from './utils'
+import { generateVideoImportTmpPath } from './utils'
 import { join } from 'path'
 import { root } from './core-utils'
 import { ensureDir, writeFile, remove } from 'fs-extra'
@@ -16,6 +16,7 @@ export type YoutubeDLInfo = {
   nsfw?: boolean
   tags?: string[]
   thumbnailUrl?: string
+  originallyPublishedAt?: Date
 }
 
 const processOptions = {
@@ -40,7 +41,7 @@ function getYoutubeDLInfo (url: string, opts?: string[]): Promise<YoutubeDLInfo>
 }
 
 function downloadYoutubeDLVideo (url: string, timeout: number) {
-  const path = generateVideoTmpPath(url)
+  const path = generateVideoImportTmpPath(url)
   let timer
 
   logger.info('Importing youtubeDL video %s', url)
@@ -142,13 +143,33 @@ async function safeGetYoutubeDL () {
   return youtubeDL
 }
 
+function buildOriginallyPublishedAt (obj: any) {
+  let originallyPublishedAt: Date = null
+
+  const uploadDateMatcher = /^(\d{4})(\d{2})(\d{2})$/.exec(obj.upload_date)
+  if (uploadDateMatcher) {
+    originallyPublishedAt = new Date()
+    originallyPublishedAt.setHours(0, 0, 0, 0)
+
+    const year = parseInt(uploadDateMatcher[1], 10)
+    // Month starts from 0
+    const month = parseInt(uploadDateMatcher[2], 10) - 1
+    const day = parseInt(uploadDateMatcher[3], 10)
+
+    originallyPublishedAt.setFullYear(year, month, day)
+  }
+
+  return originallyPublishedAt
+}
+
 // ---------------------------------------------------------------------------
 
 export {
   updateYoutubeDLBinary,
   downloadYoutubeDLVideo,
   getYoutubeDLInfo,
-  safeGetYoutubeDL
+  safeGetYoutubeDL,
+  buildOriginallyPublishedAt
 }
 
 // ---------------------------------------------------------------------------
@@ -180,7 +201,8 @@ function buildVideoInfo (obj: any) {
     licence: getLicence(obj.license),
     nsfw: isNSFW(obj),
     tags: getTags(obj.tags),
-    thumbnailUrl: obj.thumbnail || undefined
+    thumbnailUrl: obj.thumbnail || undefined,
+    originallyPublishedAt: buildOriginallyPublishedAt(obj)
   }
 }
 
